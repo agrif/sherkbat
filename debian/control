@@ -1,0 +1,15 @@
+Source: sherkbat-dkms
+Maintainer: Aaron Griffith <aargri@gmail.com>
+Homepage: https://github.com/agrif/sherkbat
+Standards-Version: 4.5.1
+Build-Depends: debhelper (>= 9), dkms
+Section: kernel
+Priority: optional
+
+Package: sherkbat-dkms
+Architecture: all
+Depends: ${misc:Depends}
+Section: kernel
+Priority: optional
+Description: DKMS source for the sherkbat battery driver
+ A battery driver for dumb batteries hooked up to an INA219 sensor.
