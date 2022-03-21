@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+
+import enum
+import json
+import os.path
+import socket
+import time
+
+import attr
+import click
+import smbus
+
+class Register(enum.IntEnum):
+    CONFIGURATION = 0x00
+    SHUNT_VOLTAGE = 0x01
+    BUS_VOLTAGE = 0x02
+    POWER = 0x03
+    CURRENT = 0x04
+    CALIBRATION = 0x05
+
+class BusRange(enum.Enum):
+    V16 = 0
+    V32 = 1
+
+class Gain(enum.Enum):
+    mV40 = 0b00
+    mV80 = 0b01
+    mV160 = 0b10
+    mV320 = 0b11
+
+class ADC(enum.Enum):
+    BIT9 = 0b0000
+    BIT10 = 0b0001
+    BIT11 = 0b0010
+    BIT12 = 0b0011
+
+    SAMPLE2 = 0b1001
+    SAMPLE4 = 0b1010
+    SAMPLE8 = 0b1011
+    SAMPLE16 = 0b1100
+    SAMPLE32 = 0b1101
+    SAMPLE64 = 0b1110
+    SAMPLE128 = 0b1111
+
+    @classmethod
+    def from_value(cls, value):
+        if not value & 0b1000:
+            return cls(value & 0b0011)
+        if value == 0b1000:
+            return cls.BIT12
+        return cls(value)
+
+class Mode(enum.Enum):
+    POWER_DOWN = 0b000
+    SHUNT_TRIGGERED = 0b001
+    BUS_TRIGGERED = 0b010
+    BOTH_TRIGGERED = 0b011
+    ADC_OFF = 0b100
+    SHUNT_CONTINUOUS = 0b101
+    BUS_CONTINUOUS = 0b110
+    BOTH_CONTINUOUS = 0b111
+
+@attr.s
+class Configuration:
+    reset = attr.ib(type=bool, default=False)
+    busrange = attr.ib(type=BusRange, default=BusRange.V32)
+    gain = attr.ib(type=Gain, default=Gain.mV320)
+    busadc = attr.ib(type=ADC, default=ADC.BIT12)
+    shuntadc = attr.ib(type=ADC, default=ADC.BIT12)
+    mode = attr.ib(type=Mode, default=Mode.BOTH_CONTINUOUS)
+
+    def to_value(self):
+        val = 0
+        val |= int(self.reset) << 15
+        val |= self.busrange.value << 13
+        val |= self.gain.value << 11
+        val |= self.busadc.value << 7
+        val |= self.shuntadc.value << 3
+        val |= self.mode.value
+        return val
+
+    @classmethod
+    def from_value(cls, value):
+        reset = bool((value >> 15) & 1)
+        busrange = BusRange((value >> 13) & 1)
+        gain = Gain((value >> 11) & 0b11)
+        busadc = ADC.from_value((value >> 7) & 0b1111)
+        shuntadc = ADC.from_value((value >> 3) & 0b1111)
+        mode = Mode(value & 0b111)
+        return cls(reset, busrange, gain, busadc, shuntadc, mode)
+
+class INA219:
+    def __init__(self, bus, addr=0x40, shunt_value=0.1):
+        self.bus = bus
+        self.addr = addr
+        self.shunt_value = shunt_value
+
+    def read_raw(self, reg):
+        return socket.ntohs(self.bus.read_word_data(self.addr, reg))
+
+    def write_raw(self, reg, value):
+        self.bus.write_word_data(self.addr, reg, socket.htons(value))
+
+    def reset(self):
+        # could use Configuration struct, but this works fine
+        self.write_raw(Register.CONFIGURATION, 1 << 15)
+
+    def read_configuration(self):
+        return Configuration.from_value(self.read_raw(Register.CONFIGURATION))
+
+    def write_configuration(self, config):
+        self.write_raw(Register.CONFIGURATION, config.to_value())
+        return config
+
+    def configure(self, **kwargs):
+        conf = self.read_configuration()
+        for k, v in kwargs.items():
+            setattr(conf, k, v)
+        return self.write_configuration(conf)
+
+    @property
+    def shunt_voltage(self):
+        v = self.read_raw(Register.SHUNT_VOLTAGE)
+        if v & (1 << 15):
+            v = -(~v + 1)
+        # v is in 10uV = 1e-5 V
+        return v * 1e-5
+
+    @property
+    def bus_voltage(self):
+        v = self.read_raw(Register.BUS_VOLTAGE) >> 3
+        # v is in 4mV = 4e-3 V
+        return v * 4e-3
+
+    @property
+    def conversion_ready(self):
+        return bool(self.read_raw(Register.BUS_VOLTAGE) & 0b10)
+
+    @property
+    def overflow(self):
+        return bool(self.read_raw(Register.BUS_VOLTAGE) & 0b01)
+
+    # We totally avoid the calibration register
+
+    @property
+    def current(self):
+        return self.shunt_voltage / self.shunt_value
+
+    @property
+    def power(self):
+        return self.current * self.bus_voltage
+
+@click.command()
+@click.option('-b', '--bus', default=1,
+              help='I2C bus number to use', metavar='N')
+@click.option('-a', '--address', default=0x40,
+              help='I2C address of INA219', metavar='ADDR')
+@click.option('-s', '--shunt', default=0.1,
+              help='shunt resistor value, in ohms (default: 0.1)', metavar='R')
+@click.option('-f', '--format',
+              type=click.Choice(['plain', 'json'], case_sensitive=False),
+              default='plain',
+              help='format to use', metavar='FMT')
+def main(bus, address, shunt, format):
+    if os.path.exists('/sys/class/power_supply/sherkbat'):
+        # if sherkbat is loaded, trust it
+        devs = os.listdir('/sys/class/power_supply/sherkbat/device/hwmon')
+        if not devs:
+            raise RuntimeError('cannot find hwmon instance for sherkbat')
+        hwmon = os.path.join('/sys/class/power_supply/sherkbat/device/hwmon', devs[0])
+        def readval(name):
+            try:
+                with open(os.path.join(hwmon, name)) as f:
+                    data = f.read().strip()
+                return int(data)
+            except (IOError, ValueError):
+                raise RuntimeError('could not read {}'.format(name))
+        
+        class Storage:
+            pass
+        d = Storage()
+
+        d.shunt_voltage = readval('in0_input') / 1_000
+        d.bus_voltage = readval('in1_input') / 1_000
+        d.current = readval('curr1_input') / 1_000
+        d.power = readval('power1_input') / 1_000_000
+    else:
+        # read i2c ourselves
+        d = INA219(smbus.SMBus(bus), address, shunt_value=shunt)
+        d.reset()
+        d.configure(busadc=ADC.SAMPLE128, shuntadc=ADC.SAMPLE128)
+
+        # max read time is under 100ms
+        time.sleep(0.1)
+
+    if format == 'plain':
+        print('Shunt Voltage:', d.shunt_voltage, 'V')
+        print('Bus Voltage:', d.bus_voltage, 'V')
+        print('Current:', d.current, 'A')
+        print('Power:', d.power, 'W')
+    elif format == 'json':
+        print(json.dumps({
+            'shunt_voltage': d.shunt_voltage,
+            'bus_voltage': d.bus_voltage,
+            'current': d.current,
+            'power': d.power,
+        }))
+    else:
+        raise RuntimeError('unreachable')
+
+if __name__ == '__main__':
+    main()
