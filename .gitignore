@@ -6,6 +6,8 @@
 /src/*.mod*
 /src/*.o
 
+/sherkbat.dtbo
+
 /debian/.debhelper/
 /debian/debhelper-build-stamp
 /debian/files
